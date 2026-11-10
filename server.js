@@ -12,6 +12,8 @@ const MAX_ROOMS = 500;
 const MAX_MSG = 64 * 1024;
 
 const rooms = new Map(); // code -> { host, guest }
+const queues = new Map(); // match settings key -> a player waiting for a random match
+function unqueue(ws) { if (ws.q && queues.get(ws.q) === ws) queues.delete(ws.q); ws.q = null; }
 
 const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
@@ -72,7 +74,26 @@ wss.on('connection', ws => {
         let m; try { m = JSON.parse(data.toString()); } catch (e) { return; }
         if (!m || typeof m.t !== 'string') return;
 
+        if (m.t === 'queue') {
+            if (ws.room) leave(ws);
+            unqueue(ws);
+            const key = String(m.k || '');
+            if (!/^[1-5]-[01]-[235]$/.test(key)) return sendJSON(ws, { t: 'err', m: 'Bad match settings.' });
+            const w = queues.get(key);
+            if (w && w !== ws && w.readyState === 1 && !w.room) {
+                const code = newCode();
+                if (!code || rooms.size >= MAX_ROOMS) return sendJSON(ws, { t: 'err', m: 'Server is full, try again later.' });
+                queues.delete(key); w.q = null;
+                rooms.set(code, { host: w, guest: ws });
+                w.room = code; ws.room = code;
+                sendJSON(w, { t: 'matched', role: 'host', code });
+                sendJSON(ws, { t: 'matched', role: 'guest', code });
+            } else { queues.set(key, ws); ws.q = key; sendJSON(ws, { t: 'queued' }); }
+            return;
+        }
+        if (m.t === 'unqueue') { unqueue(ws); return; }
         if (m.t === 'create') {
+            unqueue(ws);
             if (ws.room) leave(ws);
             if (rooms.size >= MAX_ROOMS) return sendJSON(ws, { t: 'err', m: 'Server is full, try again later.' });
             const code = newCode();
@@ -82,6 +103,7 @@ wss.on('connection', ws => {
             return sendJSON(ws, { t: 'created', code });
         }
         if (m.t === 'join') {
+            unqueue(ws);
             if (ws.room) leave(ws);
             const code = String(m.code || '').toUpperCase().trim();
             const r = rooms.get(code);
@@ -97,7 +119,7 @@ wss.on('connection', ws => {
         if (other && other.readyState === 1) other.send(data.toString());
     });
 
-    ws.on('close', () => leave(ws));
+    ws.on('close', () => { unqueue(ws); leave(ws); });
     ws.on('error', () => {});
 });
 
