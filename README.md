@@ -13,3 +13,6 @@ A tiny WebSocket relay for CES2K online matches.
 Optional env var: `ALLOWED_ORIGINS=https://codxeditor.com` to only accept connections from your game's site.
 
 Free instances sleep after ~15 min idle; the first connection can take up to a minute to wake it.
+
+## Commentator voice (Fish Audio)
+In Render -> Environment add `FISH_API_KEY` (from fish.audio -> API). The voice used is `cedc9cf6ac2d4a6ba28420aa982217f6`; override with `FISH_VOICE_ID`. Without a key the game falls back to the browser voice.

@@ -10,12 +10,46 @@ const ALLOWED = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no I or O
 const MAX_ROOMS = 500;
 const MAX_MSG = 64 * 1024;
+// If a player's connection backs up past this many bytes, stale game snapshots are dropped instead of queued.
+// Queueing them is what made the guest's game lag more and more over time.
+const MAX_BACKLOG = 24 * 1024;
 
 const rooms = new Map(); // code -> { host, guest }
 const queues = new Map(); // match settings key -> a player waiting for a random match
 function unqueue(ws) { if (ws.q && queues.get(ws.q) === ws) queues.delete(ws.q); ws.q = null; }
 
+// ---- commentator voice: proxies Fish Audio text-to-speech so the API key never reaches the browser ----
+const FISH_KEY = process.env.FISH_API_KEY || '';
+const FISH_VOICE = process.env.FISH_VOICE_ID || 'cedc9cf6ac2d4a6ba28420aa982217f6';
+const ttsCache = new Map(); // text -> Buffer
+const ttsHits = new Map();  // ip -> { n, t }
+async function handleTTS(req, res, url) {
+    const cors = { 'Access-Control-Allow-Origin': '*' };
+    const fail = (c, m) => { res.writeHead(c, Object.assign({ 'Content-Type': 'text/plain' }, cors)); res.end(m); };
+    if (!FISH_KEY) return fail(503, 'No FISH_API_KEY set on the server.');
+    const text = String(url.searchParams.get('text') || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!text) return fail(400, 'No text.');
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(), now = Date.now();
+    const h = ttsHits.get(ip) || { n: 0, t: now }; if (now - h.t > 60000) { h.n = 0; h.t = now; } h.n++; ttsHits.set(ip, h);
+    if (h.n > 40) return fail(429, 'Slow down.');
+    let buf = ttsCache.get(text);
+    if (!buf) {
+        try {
+            const r = await fetch('https://api.fish.audio/v1/tts', { method: 'POST', headers: { Authorization: 'Bearer ' + FISH_KEY, 'Content-Type': 'application/json', model: 's1' },
+                body: JSON.stringify({ text, reference_id: FISH_VOICE, format: 'mp3', latency: 'balanced', normalize: true }) });
+            if (!r.ok) return fail(502, 'Voice service error ' + r.status);
+            buf = Buffer.from(await r.arrayBuffer());
+        } catch (e) { return fail(502, 'Voice service unreachable.'); }
+        ttsCache.set(text, buf); if (ttsCache.size > 300) ttsCache.delete(ttsCache.keys().next().value);
+    }
+    res.writeHead(200, Object.assign({ 'Content-Type': 'audio/mpeg', 'Content-Length': buf.length, 'Cache-Control': 'public, max-age=86400' }, cors));
+    res.end(buf);
+}
+setInterval(() => { const n = Date.now(); ttsHits.forEach((h, k) => { if (n - h.t > 120000) ttsHits.delete(k); }); }, 120000);
+
 const server = http.createServer((req, res) => {
+    let url; try { url = new URL(req.url, 'http://x'); } catch (e) { url = null; }
+    if (url && url.pathname === '/tts') { handleTTS(req, res, url); return; }
     res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
     res.end('CES2K server OK. Rooms: ' + rooms.size + '\n');
 });
@@ -23,6 +57,8 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({
     server,
     maxPayload: MAX_MSG,
+    perMessageDeflate: false, // compression adds latency on tiny realtime packets
+    clientTracking: true,
     verifyClient: (info, done) => {
         if (!ALLOWED.length) return done(true);
         const o = info.origin || info.req.headers.origin || '';
@@ -57,20 +93,21 @@ function leave(ws) {
 wss.on('connection', ws => {
     ws.isAlive = true;
     ws.room = null;
-    ws.bucket = 60; ws.bucketT = Date.now();
+    ws.bucket = 400; ws.bucketT = Date.now();
+    if (ws._socket) { ws._socket.setNoDelay(true); }
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data, isBinary) => {
-        // simple rate limit: ~120 msgs/sec burst 120
-        const now = Date.now();
-        ws.bucket = Math.min(120, ws.bucket + (now - ws.bucketT) * 0.12); ws.bucketT = now;
-        if (--ws.bucket < 0) return;
-
         const room = ws.room && rooms.get(ws.room);
-        if (isBinary) { // game snapshots: host -> guest only
-            if (room && room.host === ws && room.guest) room.guest.send(data, { binary: true });
+        if (isBinary) { // game snapshots: host -> guest only (not rate limited; dropped if the guest is backed up)
+            const g = room && room.host === ws && room.guest;
+            if (g && g.readyState === 1 && g.bufferedAmount < MAX_BACKLOG) g.send(data, { binary: true });
             return;
         }
+        // simple rate limit for everything else: ~300 msgs/sec, burst 400
+        const now = Date.now();
+        ws.bucket = Math.min(400, ws.bucket + (now - ws.bucketT) * 0.3); ws.bucketT = now;
+        if (--ws.bucket < 0) return;
         let m; try { m = JSON.parse(data.toString()); } catch (e) { return; }
         if (!m || typeof m.t !== 'string') return;
 
@@ -116,7 +153,9 @@ wss.on('connection', ws => {
         // everything else is relayed to the other player in the room
         if (!room) return;
         const other = room.host === ws ? room.guest : room.host;
-        if (other && other.readyState === 1) other.send(data.toString());
+        if (!other || other.readyState !== 1) return;
+        if (m.t === 'st' && other.bufferedAmount > MAX_BACKLOG) return; // stale game state: drop
+        other.send(data, { binary: false });
     });
 
     ws.on('close', () => { unqueue(ws); leave(ws); });

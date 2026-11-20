@@ -5,3 +5,6 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: npm start
+    envVars:
+      - key: FISH_API_KEY
+        sync: false
